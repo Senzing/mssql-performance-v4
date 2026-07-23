@@ -1,0 +1,309 @@
+# mssql-performance
+
+Performance tuning for running **Senzing v4** on **Microsoft SQL Server** under high-throughput load —
+companion to
+[performance-general](https://github.com/Senzing/performance-general/blob/main/README.md). Apply
+everything below **after** the standard Senzing v4 schema and **before** loading; each `ALTER`/index step
+is metadata-only on the empty tables (instant).
+
+> [!IMPORTANT]
+> The single biggest lever is not any switch here — it is **RAM**. At scale the bottleneck is cache-miss
+> read latency, so size the buffer pool to hold as much of the working set as you can (see
+> [Key learnings](#key-learnings)).
+
+⭐ marks a key win we measured in our own v4 testing.
+
+## At a glance — the key wins
+
+| Lever | What it does | Measured impact |
+|---|---|---|
+| ⭐ [Max server memory](#-max-server-memory) | Holds the working set in the buffer pool | **#1 lever** at scale |
+| ⭐ [RES_ENT.FEATURES store](#engine-side-settings-that-drive-db-load) _(v4.4+)_ | Engine feature cache — collapses reads/record | **Largest read cut** |
+| ⭐ [Optimize for sequential key](#-optimize-for-sequential-key) | Fixes the last-page `PAGELATCH_EX` insert convoy | **Removes the insert ceiling** |
+| ⭐ [Cluster the heaps](#-cluster-the-sequential-key-heaps) | Stops `VARCHAR(MAX)` row-forwarding on OBS_ENT / RES_ENT | **+9–13%** · latch 862K→8.5K ms |
+| ⭐ [Cover RES_FEAT_EKEY](#-cover-the-res_feat_ekey-by-entity-index) | Kills key-lookups on the by-entity seek | shared-lock wait **−78%** |
+| ⭐ [Read-committed snapshot](#-read-committed-snapshot-rcsi) | Eliminates lock-manager waits at ~zero cost | `LCK_M_*` → **0** |
+| ⭐ [ODBC fastvalidate](#odbc-client) | Debian unixODBC vs Microsoft's prebuilt driver-manager | **~10× faster** |
+
+---
+
+# Database settings
+
+## UTF-8 database
+
+```sql
+CREATE DATABASE senzing COLLATE Latin1_General_100_CS_AI_SC_UTF8;
+```
+
+Required. The `_UTF8` collations require **SQL Server 2019 or later**.
+
+## Batch-commit durability
+
+```sql
+ALTER DATABASE senzing SET DELAYED_DURABILITY = FORCED;
+```
+
+A large throughput win for bulk load.
+
+## Simple recovery
+
+```sql
+ALTER DATABASE senzing SET RECOVERY SIMPLE;
+```
+
+For load / perf environments — avoids log-backup management and runaway log growth. Not a production DR
+posture.
+
+## Async statistics
+
+```sql
+ALTER DATABASE senzing SET AUTO_CREATE_STATISTICS ON;
+ALTER DATABASE senzing SET AUTO_UPDATE_STATISTICS_ASYNC ON;
+```
+
+Don't stall worker threads on a synchronous statistics refresh.
+
+## ⭐ Read-committed snapshot (RCSI)
+
+```sql
+ALTER DATABASE senzing SET ALLOW_SNAPSHOT_ISOLATION ON;
+ALTER DATABASE senzing SET READ_COMMITTED_SNAPSHOT ON;
+```
+
+Eliminates lock-manager (`LCK_M_*`) waits at effectively zero version-store cost. Keep it on.
+
+## Turn off Query Store
+
+```sql
+ALTER DATABASE senzing SET QUERY_STORE = OFF;
+```
+
+Pure overhead (`QDS_ASYNC_QUEUE`) for this write-heavy load.
+
+## Leave ADR / Optimized Locking off
+
+> [!CAUTION]
+> Do **not** enable `ACCELERATED_DATABASE_RECOVERY` or `OPTIMIZED_LOCKING` for a large cache-bound load.
+> ADR's persistent version store steals buffer pool from the hot feature tables (measured net-negative),
+> and Optimized Locking (which requires ADR; SQL Server 2025+) only claws back part of that. RCSI already
+> covers lock contention.
+
+# Instance & server settings
+
+## Parallelism
+
+```sql
+EXEC sp_configure 'max degree of parallelism', 0;
+EXEC sp_configure 'cost threshold for parallelism', 100;
+```
+
+A high cost threshold keeps the cheap per-record OLTP queries serial without force-serializing
+everything. Do **not** pin `MAXDOP 1`. Bonus: a parallel plan appearing on a per-record query is then an
+automatic bad-plan alarm.
+
+## Fill factor
+
+```sql
+EXEC sp_configure 'fill factor (%)', 50;
+```
+
+In-page headroom for hot-row updates; fewer page splits.
+
+## ⭐ Max server memory
+
+```sql
+EXEC sp_configure 'max server memory (MB)', <set explicitly>;
+```
+
+Set it explicitly, just under the container/host memory limit to leave non-buffer-pool + OS headroom.
+Provision as much as you can — the buffer pool's ability to hold the working set is the dominant factor
+at scale.
+
+## Lightweight pooling
+
+```sql
+EXEC sp_configure 'lightweight pooling', 1;   -- restart required
+```
+
+Helps handle many concurrent workers with less scheduling overhead.
+
+> [!WARNING]
+> On **SQL Server on Linux its effect can be limited** — verify `run_value = 1` after restart and
+> measure; drop it if it doesn't help. (We set it but did not measure a benefit on Linux.)
+
+## Startup trace flag `-T8904` (many-core hosts)
+
+On high-core boxes at high commit rate, `-T8904` disables inline log-flush, removing the `LOGFLUSHQ`
+spinlock scaling regression and cutting system CPU. It is a **startup** trace flag — set it via
+`mssql-conf` and restart; **not** `DBCC TRACEON` (that is per-session/runtime and lost on restart).
+
+```bash
+# SQL Server on Linux — persist as a startup trace flag, then restart the instance:
+/opt/mssql/bin/mssql-conf traceflag 8904 on
+#   in a container:  docker exec <mssql-container> /opt/mssql/bin/mssql-conf traceflag 8904 on
+#   then restart SQL Server (e.g. docker restart <mssql-container>) for it to take effect.
+# On Windows: add -T8904 as a startup parameter in SQL Server Configuration Manager.
+```
+
+> [!NOTE]
+> `-T8134` is diagnostic-only: it surfaces `SPINLOCK_EXT` as a measurable wait (set the same way, for a
+> measurement window; clear it after).
+
+# Indexing & storage
+
+## ⭐ Optimize for sequential key
+
+**Critical for high-concurrency load.** The last-page insert latch (`PAGELATCH_EX`) on the ascending-key
+B-trees is the classic insert-throughput ceiling — OFSK (**SQL Server 2019+**) is its purpose-built fix,
+converting the raw convoy into managed `BTREE_INSERT_FLOW_CONTROL` and moving the wall off the DB. The v4
+schema already sets OFSK on the main hot tables; turn it on for the remaining ascending-key indexes it
+leaves off.
+
+```sql
+ALTER INDEX RES_FEAT_EKEY_PK ON RES_FEAT_EKEY SET (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON);
+ALTER INDEX RES_REL_EKEY_PK  ON RES_REL_EKEY  SET (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON);
+ALTER INDEX RES_ENT_OKEY_PK  ON RES_ENT_OKEY  SET (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON);
+ALTER INDEX RES_ENT_OKEY_SK  ON RES_ENT_OKEY  SET (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON);
+ALTER INDEX DSRC_RECORD_PK   ON DSRC_RECORD   SET (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON);
+```
+
+## ⭐ Cluster the sequential-key heaps
+
+The schema ships `OBS_ENT` and `RES_ENT` as heaps; the `VARCHAR(MAX)` feature-blob update forwards heap
+rows and makes them the **#1 `PAGELATCH_EX` source**. Clustering fixes it (**+9–13%**). Leave
+`DSRC_RECORD` a heap — its PK is a non-sequential varchar key, so clustering gains nothing and scatters
+page splits.
+
+```sql
+ALTER TABLE OBS_ENT DROP CONSTRAINT OBS_ENT_PK;
+ALTER TABLE OBS_ENT ADD CONSTRAINT OBS_ENT_PK PRIMARY KEY CLUSTERED (OBS_ENT_ID)
+  WITH (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON);
+ALTER TABLE RES_ENT DROP CONSTRAINT RES_ENT_PK;
+ALTER TABLE RES_ENT ADD CONSTRAINT RES_ENT_PK PRIMARY KEY CLUSTERED (RES_ENT_ID)
+  WITH (OPTIMIZE_FOR_SEQUENTIAL_KEY = ON);
+```
+
+## ⭐ Cover the RES_FEAT_EKEY by-entity index
+
+Adding the immutable `FTYPE_ID` stops the by-entity seek doing key lookups back to the clustered PK
+(shared-lock wait **−78%**), with no write amplification.
+
+```sql
+CREATE NONCLUSTERED INDEX RES_FEAT_EKEY_SK ON RES_FEAT_EKEY (RES_ENT_ID, FTYPE_ID)
+  WITH (DROP_EXISTING = ON);
+```
+
+<details>
+<summary><b>High feature-density data (~100+ features/record) only</b> — fully cover the candidate feature-load</summary>
+
+> [!WARNING]
+> A DBA knob, **not** a default — it enlarges the index and raises fragmentation (needs periodic
+> `ONLINE REORGANIZE`). Unnecessary below high density.
+
+```sql
+CREATE NONCLUSTERED INDEX RES_FEAT_EKEY_SK ON RES_FEAT_EKEY (RES_ENT_ID, FTYPE_ID)
+  INCLUDE (SUPPRESSED, OBS_ENT_CNT) WITH (DROP_EXISTING = ON, FILLFACTOR = 50);
+```
+</details>
+
+## Compression
+
+PAGE on the integer-key / JSON tables; ROW on `LIB_FEAT` (its `FEAT_HASH` is incompressible, so ROW ≈ PAGE
+at lower decompress cost). Rebuild the table **and** all its indexes. Little added CPU, and it defers the
+read-IO crossover as the DB grows.
+
+<details>
+<summary>Show the compression rebuild block</summary>
+
+```sql
+-- PAGE on the integer-key / JSON tables:
+ALTER TABLE OBS_ENT       REBUILD WITH (DATA_COMPRESSION = PAGE);
+ALTER INDEX ALL ON OBS_ENT REBUILD WITH (DATA_COMPRESSION = PAGE);
+-- ...repeat for RES_ENT, RES_FEAT_EKEY, RES_FEAT_STAT, RES_RELATE, RES_ENT_OKEY, RES_REL_EKEY, DSRC_RECORD
+-- ROW on LIB_FEAT:
+ALTER TABLE LIB_FEAT       REBUILD WITH (DATA_COMPRESSION = ROW);
+ALTER INDEX ALL ON LIB_FEAT REBUILD WITH (DATA_COMPRESSION = ROW);
+```
+</details>
+
+## Multiple data files
+
+Spreads allocation / free-space (`SPACEMGR_FREESPACE_CACHE`, PFS/GAM) contention across files under many
+concurrent inserters. Pre-size for large loads (on Linux ext4/xfs this uses `fallocate` — seconds, not a
+zero-fill; the `instant_file_initialization_enabled` DMV false-negatives `N` on Linux, ignore it).
+
+> [!WARNING]
+> Applies wherever **you control the database files** — self-managed SQL Server (bare metal, VM, or
+> container) and Azure SQL Managed Instance. It does **not** apply to Azure SQL Database **Hyperscale**,
+> where page servers manage storage and there are no user data files.
+
+```sql
+ALTER DATABASE senzing MODIFY FILE (NAME = senzing, SIZE = <presize>, FILEGROWTH = 32768MB);
+ALTER DATABASE senzing ADD FILE (NAME = senzing_2, FILENAME = '.../senzing_2.ndf', SIZE = <presize>, FILEGROWTH = 32768MB)
+  TO FILEGROUP [PRIMARY];
+-- ...repeat to ~8 equally-sized files...
+ALTER DATABASE senzing MODIFY FILEGROUP [PRIMARY] AUTOGROW_ALL_FILES;
+```
+
+## Wide feature-value column
+
+Ensure `LIB_FEAT.FELEM_VALUES` is `VARCHAR(MAX)` — long or multibyte (e.g. CJK) feature values otherwise
+fail to insert.
+
+# ODBC client
+
+Senzing application containers reach SQL Server through ODBC:
+
+- ⭐ Use **ODBC Driver 18** (`msodbcsql18`) with **Debian's** `unixodbc` (built `--enable-fastvalidate`;
+  Microsoft's prebuilt driver-manager is not → **~10× slower**).
+- ODBC Driver 18 defaults to `Encrypt=yes`; a lab without TLS certs needs `Encrypt=no` (or
+  `TrustServerCertificate=yes`) in the connection string.
+
+> [!NOTE]
+> **`AutoTranslate`: leave at the default.** With the UTF-8 collation, UTF-8 text (including CJK and
+> supplementary-plane / emoji characters) round-trips byte-exact whether `AutoTranslate` is on or off
+> (verified). The old `AutoTranslate = No` workaround was for non-UTF-8 (pre-2019) collations and is not
+> required here.
+
+# Engine-side settings that drive DB load
+
+These are Senzing engine settings, not SQL Server knobs, but they dominate the load profile:
+
+- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing v4.4+**) — the single largest reduction
+  in physical reads/record.
+- **On high-name-density data, set the generic NAME behavior to `"sendToRedo":"No"`** — otherwise generic
+  name keys generate a self-amplifying redo pile that starves forward progress.
+
+# Monitoring — what's going on?
+
+```sql
+-- Live statements
+SELECT r.session_id, r.wait_type, t.text
+FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t;
+
+-- Waits (take a snapshot -> delta, not the cumulative total)
+SELECT wait_type, wait_time_ms FROM sys.dm_os_wait_stats ORDER BY wait_time_ms DESC;
+
+-- Row counts (do NOT COUNT(*) the large tables under load — it scans and stalls)
+SELECT OBJECT_NAME(object_id) AS tbl, SUM(row_count) AS rows
+FROM sys.dm_db_partition_stats WHERE index_id IN (0, 1) GROUP BY object_id;
+```
+
+- **The signal at scale:** `PAGEIOLATCH_SH` dominating the waits means cache-miss random reads (working
+  set > buffer pool). The answer is fewer reads/record and more RAM — not a faster log or more CPU.
+- Read spinlock **backoffs** (not raw spins) from `sys.dm_os_spinlock_stats`.
+- `sys.dm_exec_query_stats` is eviction-lossy; truncating a table erases its statistics.
+- On GRAID / high-end NVMe arrays, `iostat %util` is meaningless (it saturates at one outstanding IO) —
+  use `r_await` and `sys.dm_io_virtual_file_stats`.
+
+# Key learnings
+
+- **At scale the bottleneck is read latency, not CPU / log / network.** Once the working set outgrows the
+  buffer pool, `PAGEIOLATCH_SH` (8 KB random reads) dominates. The two levers that move it: reduce
+  reads/record (the feature store), and give the buffer pool enough RAM.
+- **Per-record throughput drifts down as the DB grows, then flattens.** It tracks the working-set-vs-pool
+  ratio, so it is steep while the working set is crossing the pool size and flattens once the DB is much
+  larger than the pool — it does not keep accelerating. Provision RAM generously, and measure knob
+  comparisons A/B/A to subtract drift.
+- **RCSI is the lock-contention fix; `-T8904` removes a many-core scaling regression** but does not raise
+  the ceiling — the ceiling is the read-latency wall above.
