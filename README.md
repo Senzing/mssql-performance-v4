@@ -94,20 +94,54 @@ Pure overhead (`QDS_ASYNC_QUEUE`) for this write-heavy load.
 
 ```sql
 EXEC sp_configure 'max degree of parallelism', 0;
-EXEC sp_configure 'cost threshold for parallelism', 100;
+EXEC sp_configure 'cost threshold for parallelism', 500;
 ```
 
 A high cost threshold keeps the cheap per-record OLTP queries serial without force-serializing
 everything. Do **not** pin `MAXDOP 1`. Bonus: a parallel plan appearing on a per-record query is then an
 automatic bad-plan alarm.
 
+Verified on the ~1B-record fleet at 500: every engine statement runs at **average DOP 1.00**, and the only
+parallel work left is SQL Server's own internal background tasks. The engine workload is fully serial,
+which is the intent.
+
 ## Fill factor
 
+Set it **per index, by insert pattern** — not server-wide.
+
 ```sql
-EXEC sp_configure 'fill factor (%)', 50;
+-- Random-key indexes (inserts land mid-tree → real page splits): leave headroom.
+--   e.g. LIB_FEAT_SK, keyed on FEAT_HASH
+ALTER INDEX LIB_FEAT_SK ON LIB_FEAT REBUILD WITH (FILLFACTOR = 50);
+
+-- Ascending-key clustered PKs (inserts append at the right edge → no mid-tree splits): pack them.
+ALTER INDEX LIB_FEAT_PK      ON LIB_FEAT      REBUILD WITH (FILLFACTOR = 100);
+ALTER INDEX RES_FEAT_STAT_PK ON RES_FEAT_STAT REBUILD WITH (FILLFACTOR = 100);
 ```
 
-In-page headroom for hot-row updates; fewer page splits.
+The old advice here was a server-wide `sp_configure 'fill factor (%)', 50` justified as *"in-page
+headroom for hot-row updates."* That is right for randomly-keyed indexes and wrong for the ones keyed
+on a monotonic ID, which is most of the hot set. Measured on a 16.4-billion-row load:
+
+| index | key | measured page fullness | verdict |
+|---|---|---|---|
+| `RES_FEAT_STAT_PK` | `LIB_FEAT_ID`, ascending | **~89% full** | fill factor 50 is *inert* — appended pages fill anyway |
+| `LIB_FEAT_PK` | `LIB_FEAT_ID`, ascending | **~74% full** | ~23% of a 3.4 TB index is slack, for updates that never happen |
+| `LIB_FEAT_SK` | `FEAT_HASH`, random | ~75% full | **keep 50** — genuinely splitting |
+
+Two things make the blanket 50 a poor default:
+
+* **Fill factor only applies at CREATE/REBUILD.** On an append-mostly table, new right-edge pages fill
+  to ~100% regardless of the setting, so it does not deliver the headroom it promises — it just leaves
+  whatever slack the last rebuild created.
+* **In a cache-bound load, empty page space is the expensive kind.** When the working set is many times
+  the buffer pool and `PAGEIOLATCH_SH` is the #1 wait, half-full pages halve effective residency. On
+  `LIB_FEAT_PK` alone the slack is ~790 GB.
+
+> [!NOTE]
+> Under **RCSI** an updated row grows by a 14-byte version pointer, so genuinely-updated tables *do*
+> need some headroom — that, not "hot-row updates" in general, is the real justification. It does not
+> apply to write-once tables such as `LIB_FEAT`.
 
 ## ⭐ Max server memory
 
@@ -208,9 +242,31 @@ CREATE NONCLUSTERED INDEX RES_FEAT_EKEY_SK ON RES_FEAT_EKEY (RES_ENT_ID, FTYPE_I
 
 ## Compression
 
-PAGE on the integer-key / JSON tables; ROW on `LIB_FEAT` (its `FEAT_HASH` is incompressible, so ROW ≈ PAGE
-at lower decompress cost). Rebuild the table **and** all its indexes. Little added CPU, and it defers the
-read-IO crossover as the DB grows.
+PAGE on the hot tables — **including `LIB_FEAT`**. Rebuild the table **and** all its indexes. Little added
+CPU, and it defers the read-IO crossover as the DB grows.
+
+> [!IMPORTANT]
+> This previously said *"ROW on `LIB_FEAT` (its `FEAT_HASH` is incompressible, so ROW ≈ PAGE at lower
+> decompress cost)."* The premise is correct — `FEAT_HASH` really is incompressible — but the conclusion
+> does not follow, because `FEAT_HASH` is only 40 of ~164 bytes. Measured on a 200k-row stratified sample
+> at production row density (139.0 avg variable bytes/row vs the corpus's 139.7):
+>
+> | compression | bytes/row | vs NONE |
+> |---|---|---|
+> | NONE | 335.2 | — |
+> | ROW | 325.4 | **2.9%** |
+> | PAGE | 298.8 | **10.9%** |
+>
+> ROW recovers only ~10 bytes/row because it squeezes *fixed-width* storage, and just 13 of ~164 bytes are
+> fixed. It cannot touch the ~139 bytes of `FEAT_HASH` + `FEAT_DESC` + `FELEM_VALUES` that are 85% of the
+> row. PAGE's prefix/dictionary compression does reach `FEAT_DESC` and `FELEM_VALUES`. **ROW is not ≈ PAGE
+> here; it is 8.2% worse**, which on `LIB_FEAT`'s two indexes (3.4 TB + 1.6 TB) is ~400 GB.
+>
+> This matters more than the percentage suggests: `LIB_FEAT` cache-miss random reads are the documented
+> wall for this workload (`PAGEIOLATCH_SH` #1 at ~67% of wait time; `LIB_FEAT` the top physical-read
+> source at 195.7M reads, driven by ~1.4B `FEAT_HASH` seeks → key lookups per 3 hours). Leaving the
+> table that *is* the bottleneck on the weaker compression is the wrong trade — and PAGE was already
+> measured on the other hot tables here as throughput-positive with little added CPU.
 
 <details>
 <summary>Show the compression rebuild block</summary>
@@ -220,9 +276,9 @@ read-IO crossover as the DB grows.
 ALTER TABLE OBS_ENT       REBUILD WITH (DATA_COMPRESSION = PAGE);
 ALTER INDEX ALL ON OBS_ENT REBUILD WITH (DATA_COMPRESSION = PAGE);
 -- ...repeat for RES_ENT, RES_FEAT_EKEY, RES_FEAT_STAT, RES_RELATE, RES_ENT_OKEY, RES_REL_EKEY, DSRC_RECORD
--- ROW on LIB_FEAT:
-ALTER TABLE LIB_FEAT       REBUILD WITH (DATA_COMPRESSION = ROW);
-ALTER INDEX ALL ON LIB_FEAT REBUILD WITH (DATA_COMPRESSION = ROW);
+-- PAGE on LIB_FEAT too (measured 10.9% vs 2.9% for ROW — see the note above):
+ALTER TABLE LIB_FEAT       REBUILD WITH (DATA_COMPRESSION = PAGE);
+ALTER INDEX ALL ON LIB_FEAT REBUILD WITH (DATA_COMPRESSION = PAGE);
 ```
 </details>
 
