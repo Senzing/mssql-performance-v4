@@ -2,7 +2,7 @@
 
 Performance tuning for running **Senzing v4** on **Microsoft SQL Server** under high-throughput load —
 companion to
-[performance-general](https://github.com/Senzing/performance-general/blob/main/README.md). Apply
+[performance-general-v4](https://github.com/Senzing/performance-general-v4/blob/main/README.md). Apply
 everything below **after** the standard Senzing v4 schema and **before** loading; each `ALTER`/index step
 is metadata-only on the empty tables (instant).
 
