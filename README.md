@@ -101,7 +101,7 @@ A high cost threshold keeps the cheap per-record OLTP queries serial without for
 everything. Do **not** pin `MAXDOP 1`. Bonus: a parallel plan appearing on a per-record query is then an
 automatic bad-plan alarm.
 
-Verified on the ~1B-record fleet at 500: every engine statement runs at **average DOP 1.00**, and the only
+Verified on a ~1B-record fleet at 500: every engine statement runs at **average DOP 1.00**, and the only
 parallel work left is SQL Server's own internal background tasks. The engine workload is fully serial,
 which is the intent.
 
