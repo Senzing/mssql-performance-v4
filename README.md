@@ -240,6 +240,24 @@ CREATE NONCLUSTERED INDEX RES_FEAT_EKEY_SK ON RES_FEAT_EKEY (RES_ENT_ID, FTYPE_I
 ```
 </details>
 
+## ⭐ Drop IX_EVAL_QUEUE — redundant with the primary key
+
+`SYS_EVAL_QUEUE` has the PK on `MSG_ID` plus `IX_EVAL_QUEUE (ENT_SRC_KEY, DSRC_CODE)`; the latter is
+**redundant**. `MSG_ID = fnv1a_hash(encrypted ENT_SRC_KEY) >> 1` is deterministic in `ENT_SRC_KEY`,
+and the enqueue's `DSRC_CODE` is the constant `'__REPAIR__'`, so both uniques are **1:1 with the
+entity** — one entity targets exactly one row.
+
+On MSSQL the enqueue does a plain `INSERT` and treats the resulting unique-constraint violation as
+**success** (a duplicate repair intent is a no-op) — the **PK** violation serves that dedup
+identically once `IX_EVAL_QUEUE` is gone. No query seeks on `(ENT_SRC_KEY, DSRC_CODE)`; every read is
+by `MSG_ID` (dequeue/count/min-max), and the redo-dequeue lock waits were **100% on the PK, 0 on
+`IX_EVAL_QUEUE`**. Dropping it removes one nonclustered index maintained on every redo enqueue on the
+hottest table in the system.
+
+```sql
+DROP INDEX IX_EVAL_QUEUE ON SYS_EVAL_QUEUE;
+```
+
 ## Compression
 
 PAGE on the hot tables — **including `LIB_FEAT`**. Rebuild the table **and** all its indexes. Little added
