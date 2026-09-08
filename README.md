@@ -27,6 +27,69 @@ is metadata-only on the empty tables (instant).
 
 ---
 
+# Test platform — the hardware behind these numbers
+
+Every measured result on this page came off the rig described here. Read the numbers against it: the
+levers that matter most are **ratios** — working set vs. buffer pool, reads per record — so a box with a
+different memory-to-dataset ratio will rank them differently.
+
+## Database server (one host, database only — no engine)
+
+| | |
+|---|---|
+| Chassis | Supermicro `SYS-221H-TN24R` — 2U, 24 × U.2/U.3 NVMe bays |
+| CPU | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — **64 cores / 128 threads** total, 4.0 GHz max turbo, 60 MiB L3 per socket |
+| Memory | **1 TiB** — 16 × 64 GB DDR5-4800 (2R ECC), 16 of 32 slots populated, 2 NUMA nodes |
+| Data volume | **22 × Micron 7450 PRO 1.92 TB** U.3 NVMe in **RAID 10** behind a GRAID SupremeRAID controller (GPU-offloaded RAID, driver 1.7.2) → a single 19 TiB (21.1 TB) block device, `ext4`, holding all database files and the log |
+| Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate NIC/subnet) |
+| OS | Ubuntu 24.04 LTS, kernel 6.8 |
+
+## Application servers (two hosts, identical)
+
+| | |
+|---|---|
+| Chassis | Dell **PowerEdge R650xs** |
+| CPU | 2 × Intel **Xeon Gold 6326** (Ice Lake) — **32 cores / 64 threads** per host, 2.9 GHz base / 3.5 GHz turbo, 24 MiB L3 per socket |
+| Memory | **512 GiB** — 8 × 64 GB DDR4-3200 (2R ECC), 8 of 16 slots populated, 2 NUMA nodes |
+| Local storage | Dell BOSS SATA boot + 4–8 TB local NVMe for datasets/scratch — **not** on the database IO path |
+| Network | 10 GbE, same data-plane segment as the database server |
+| OS | Ubuntu 24.04 LTS, kernel 6.8 |
+| Role | Runs the containerized Senzing v4 workers — parallel `add_record` consumers plus redo processors — driving the database server remotely over the data-plane network |
+
+A third small host runs only the message broker that feeds the workers; it is not in the measurement path.
+
+## Database configuration on that hardware
+
+| | |
+|---|---|
+| Engine | SQL Server 2025, Developer edition, containerized on the database host |
+| Buffer pool | `max server memory` = **384 GB**, held constant across arms. The container's budget for the whole `sqlservr` process is **480 GB** — the ~96 GB gap is thread stacks, SQLPAL overhead and dump capture, *not* buffer pool. See [Max server memory](#-max-server-memory). |
+| Database files | 8 data files on the one array volume, plus the log — see [Multiple data files](#multiple-data-files) |
+| Scale measured | 100M to 1B records; ≈16.9 KB/record all-in for our corpus, so a 1B-record datastore is ≈**16 TiB** |
+
+## What this shape implies
+
+- **The buffer pool is deliberately oversubscribed.** At 1B records ≈16 TiB of datastore sits against a
+  384 GB pool — roughly **42×**. That ratio is the whole point of the test: it is what makes cache-miss
+  random reads (`PAGEIOLATCH_SH`) the ceiling. A dataset small enough to be cache-resident on this box
+  will **not** reproduce any of the read-side results here, which is why results below ~100M records are
+  not meaningful.
+- **The engine, not the database, owns most of the CPU.** 64 application cores drive 64 database cores,
+  and the workload saturates the application side first. Adding database cores is not the scaling lever;
+  adding application hosts and cutting reads/record is.
+- **Storage is not the bottleneck.** The 22-drive RAID 10 array carried the entire 1B-record load with
+  large measured IOPS headroom, which is why every ⭐ above targets *reads per record* or *buffer-pool
+  residency* rather than faster disks. Note that on an array like this `iostat %util` is meaningless —
+  see [Monitoring](#monitoring--whats-going-on).
+- **Nor is the 10 GbE data plane.** The load is an extremely high count of very small round trips, so it
+  is sensitive to round-trip *latency* and round-trip *count*, not to bandwidth.
+- **Some settings below exist *because* of this core count.** The `-T8904` trace flag removes a
+  `LOGFLUSHQ` spinlock regression that only appears on a high-core host at a high commit rate, and the
+  `cost threshold for parallelism = 500` result was verified against these 64 database cores. On a much
+  smaller box both matter less.
+
+---
+
 # Database settings
 
 ## UTF-8 database
