@@ -1,6 +1,13 @@
-<p><img src="assets/senzing-logo.jpg" alt="Senzing logo" width="56"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/senzing-logo-dark-theme.png">
+    <img src="assets/senzing-logo-light-theme.png" alt="Senzing" width="240">
+  </picture>
+</p>
 
-# mssql-performance
+<h1 align="center">SQL Server performance</h1>
+
+<img src="assets/ember-rule.svg" alt="" width="100%" height="4">
 
 Performance tuning for running **SENZING® SDK v4** on **Microsoft SQL Server** under high-throughput load —
 companion to
@@ -9,7 +16,7 @@ everything below **after** the standard Senzing SDK v4 schema and **before** loa
 is metadata-only on the empty tables (instant).
 
 > [!IMPORTANT]
-> The single biggest lever is not any switch here — it is **random-access memory (RAM)**. At scale the bottleneck is cache-miss
+> The single biggest lever is not any switch here — it is **RAM**. At scale the bottleneck is cache-miss
 > read latency, so size the buffer pool to hold as much of the working set as you can (see
 > [Key learnings](#key-learnings)).
 
@@ -40,11 +47,11 @@ different memory-to-dataset ratio will rank them differently.
 | | |
 |---|---|
 | Chassis | Supermicro `SYS-221H-TN24R` — 2U, 24 × U.2/U.3 NVMe bays |
-| Central processing unit (CPU) | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — **64 cores / 128 threads** total, 4.0 GHz max turbo, 60 MiB L3 per socket |
+| CPU | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — **64 cores / 128 threads** total, 4.0 GHz max turbo, 60 MiB L3 per socket |
 | Memory | **1 TiB** — 16 × 64 GB DDR5-4800 (2R ECC), 16 of 32 slots populated, 2 non-uniform memory access (NUMA) nodes |
 | Data volume | **22 × Micron 7450 PRO 1.92 TB** U.3 NVMe in **RAID 10** behind a GRAID SupremeRAID controller (GPU-offloaded RAID, driver 1.7.2) → a single 19 TiB (21.1 TB) block device, `ext4`, holding all database files and the log |
 | Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate network interface card (NIC) and subnet) |
-| Operating system (OS) | Ubuntu 24.04 LTS, kernel 6.8 |
+| OS | Ubuntu 24.04 LTS, kernel 6.8 |
 
 ## Application servers (two hosts, identical)
 
@@ -145,7 +152,7 @@ ALTER DATABASE senzing SET QUERY_STORE = OFF;
 
 Pure overhead (`QDS_ASYNC_QUEUE`) for this write-heavy load.
 
-## Leave ADR / Optimized Locking off
+## Leave ADR / optimized locking off
 
 > [!CAUTION]
 > Do **not** enable accelerated database recovery (ADR, `ACCELERATED_DATABASE_RECOVERY`) or optimized
@@ -188,7 +195,7 @@ The old advice here was a server-wide `sp_configure 'fill factor (%)', 50` justi
 headroom for hot-row updates."* That is right for randomly-keyed indexes and wrong for the ones keyed
 on a monotonic ID, which is most of the hot set. Measured on a 16.4-billion-row load:
 
-| index | key | measured page fullness | verdict |
+| Index | Key | Measured page fullness | Verdict |
 |---|---|---|---|
 | `RES_FEAT_STAT_PK` | `LIB_FEAT_ID`, ascending | **~89% full** | fill factor 50 is *inert* — appended pages fill anyway |
 | `LIB_FEAT_PK` | `LIB_FEAT_ID`, ascending | **~74% full** | ~23% of a 3.4 TB index is slack, for updates that never happen |
@@ -270,7 +277,7 @@ ALTER INDEX DSRC_RECORD_PK   ON DSRC_RECORD   SET (OPTIMIZE_FOR_SEQUENTIAL_KEY =
 
 The schema ships `OBS_ENT` and `RES_ENT` as heaps; the `VARCHAR(MAX)` feature-blob update forwards heap
 rows and makes them the **#1 `PAGELATCH_EX` source**. Clustering fixes it (**+9–13%**). Leave
-`DSRC_RECORD` a heap — its PK is a non-sequential varchar key, so clustering gains nothing and scatters
+`DSRC_RECORD` a heap — its primary key (PK) is a non-sequential varchar key, so clustering gains nothing and scatters
 page splits.
 
 ```sql
@@ -307,7 +314,7 @@ CREATE NONCLUSTERED INDEX RES_FEAT_EKEY_SK ON RES_FEAT_EKEY (RES_ENT_ID, FTYPE_I
 
 ## ⭐ Drop IX_EVAL_QUEUE — redundant with the primary key
 
-`SYS_EVAL_QUEUE` has the primary key (PK) on `MSG_ID` plus `IX_EVAL_QUEUE (ENT_SRC_KEY, DSRC_CODE)`; the latter is
+`SYS_EVAL_QUEUE` has the PK on `MSG_ID` plus `IX_EVAL_QUEUE (ENT_SRC_KEY, DSRC_CODE)`; the latter is
 **redundant**. `MSG_ID = fnv1a_hash(encrypted ENT_SRC_KEY) >> 1` is deterministic in `ENT_SRC_KEY`,
 and the enqueue's `DSRC_CODE` is the constant `'__REPAIR__'`, so both uniques are **1:1 with the
 entity** — one entity targets exactly one row.
@@ -334,7 +341,7 @@ CPU, and it defers the read-IO crossover as the DB grows.
 > does not follow, because `FEAT_HASH` is only 40 of ~164 bytes. Measured on a 200k-row stratified sample
 > at production row density (139.0 avg variable bytes/row vs the corpus's 139.7):
 >
-> | compression | bytes/row | vs NONE |
+> | Compression | Bytes/row | vs NONE |
 > |---|---|---|
 > | NONE | 335.2 | — |
 > | ROW | 325.4 | **2.9%** |
@@ -372,7 +379,7 @@ concurrent inserters. Pre-size for large loads (on Linux ext4/xfs this uses `fal
 zero-fill; the `instant_file_initialization_enabled` dynamic management view (DMV) false-negatives `N` on Linux, ignore it).
 
 > [!WARNING]
-> Applies wherever **you control the database files** — self-managed SQL Server (bare metal, VM, or
+> Applies wherever **you control the database files** — self-managed SQL Server (bare metal, VM or
 > container) and Azure SQL Managed Instance. It does **not** apply to Azure SQL Database **Hyperscale**,
 > where page servers manage storage and there are no user data files.
 
@@ -406,7 +413,7 @@ Senzing application containers reach SQL Server through ODBC:
 
 # Engine-side settings that drive DB load
 
-These are Senzing engine settings, not SQL Server knobs, but they dominate the load profile:
+These are engine settings, not SQL Server knobs, but they dominate the load profile:
 
 - ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing SDK 4.4+**) — the single largest reduction
   in physical reads/record.
