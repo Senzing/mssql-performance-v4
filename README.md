@@ -2,14 +2,14 @@
 
 # mssql-performance
 
-Performance tuning for running **Senzing v4** on **Microsoft SQL Server** under high-throughput load —
+Performance tuning for running **SENZING® v4 software** on **Microsoft SQL Server** under high-throughput load —
 companion to
 [performance-general-v4](https://github.com/Senzing/performance-general-v4/blob/main/README.md). Apply
 everything below **after** the standard Senzing v4 schema and **before** loading; each `ALTER`/index step
 is metadata-only on the empty tables (instant).
 
 > [!IMPORTANT]
-> The single biggest lever is not any switch here — it is **RAM**. At scale the bottleneck is cache-miss
+> The single biggest lever is not any switch here — it is **random-access memory (RAM)**. At scale the bottleneck is cache-miss
 > read latency, so size the buffer pool to hold as much of the working set as you can (see
 > [Key learnings](#key-learnings)).
 
@@ -25,7 +25,7 @@ is metadata-only on the empty tables (instant).
 | ⭐ [Cluster the heaps](#-cluster-the-sequential-key-heaps) | Stops `VARCHAR(MAX)` row-forwarding on OBS_ENT / RES_ENT | **+9–13%** · latch 862K→8.5K ms |
 | ⭐ [Cover RES_FEAT_EKEY](#-cover-the-res_feat_ekey-by-entity-index) | Kills key-lookups on the by-entity seek | shared-lock wait **−78%** |
 | ⭐ [Read-committed snapshot](#-read-committed-snapshot-rcsi) | Eliminates lock-manager waits at ~zero cost | `LCK_M_*` → **0** |
-| ⭐ [ODBC fastvalidate](#odbc-client) | Debian unixODBC vs Microsoft's prebuilt driver-manager | **~10× faster** |
+| ⭐ [Open Database Connectivity (ODBC) fastvalidate](#odbc-client) | Debian unixODBC vs Microsoft's prebuilt driver-manager | **~10× faster** |
 
 ---
 
@@ -40,11 +40,11 @@ different memory-to-dataset ratio will rank them differently.
 | | |
 |---|---|
 | Chassis | Supermicro `SYS-221H-TN24R` — 2U, 24 × U.2/U.3 NVMe bays |
-| CPU | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — **64 cores / 128 threads** total, 4.0 GHz max turbo, 60 MiB L3 per socket |
-| Memory | **1 TiB** — 16 × 64 GB DDR5-4800 (2R ECC), 16 of 32 slots populated, 2 NUMA nodes |
+| Central processing unit (CPU) | 2 × Intel **Xeon Gold 6438Y+** (Sapphire Rapids) — **64 cores / 128 threads** total, 4.0 GHz max turbo, 60 MiB L3 per socket |
+| Memory | **1 TiB** — 16 × 64 GB DDR5-4800 (2R ECC), 16 of 32 slots populated, 2 non-uniform memory access (NUMA) nodes |
 | Data volume | **22 × Micron 7450 PRO 1.92 TB** U.3 NVMe in **RAID 10** behind a GRAID SupremeRAID controller (GPU-offloaded RAID, driver 1.7.2) → a single 19 TiB (21.1 TB) block device, `ext4`, holding all database files and the log |
-| Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate NIC/subnet) |
-| OS | Ubuntu 24.04 LTS, kernel 6.8 |
+| Network | 10 GbE on a dedicated data-plane segment (management traffic is on a separate network interface card (NIC) and subnet) |
+| Operating system (OS) | Ubuntu 24.04 LTS, kernel 6.8 |
 
 ## Application servers (two hosts, identical)
 
@@ -53,7 +53,7 @@ different memory-to-dataset ratio will rank them differently.
 | Chassis | Dell **PowerEdge R650xs** |
 | CPU | 2 × Intel **Xeon Gold 6326** (Ice Lake) — **32 cores / 64 threads** per host, 2.9 GHz base / 3.5 GHz turbo, 24 MiB L3 per socket |
 | Memory | **512 GiB** — 8 × 64 GB DDR4-3200 (2R ECC), 8 of 16 slots populated, 2 NUMA nodes |
-| Local storage | Dell BOSS SATA boot + 4–8 TB local NVMe for datasets/scratch — **not** on the database IO path |
+| Local storage | Dell BOSS SATA boot + 4–8 TB local NVMe for datasets/scratch — **not** on the database input/output (IO) path |
 | Network | 10 GbE, same data-plane segment as the database server |
 | OS | Ubuntu 24.04 LTS, kernel 6.8 |
 | Role | Runs the containerized Senzing v4 workers — parallel `add_record` consumers plus redo processors — driving the database server remotely over the data-plane network |
@@ -80,7 +80,7 @@ A third small host runs only the message broker that feeds the workers; it is no
   and the workload saturates the application side first. Adding database cores is not the scaling lever;
   adding application hosts and cutting reads/record is.
 - **Storage is not the bottleneck.** The 22-drive RAID 10 array carried the entire 1B-record load with
-  large measured IOPS headroom, which is why every ⭐ above targets *reads per record* or *buffer-pool
+  large measured input/output operations per second (IOPS) headroom, which is why every ⭐ above targets *reads per record* or *buffer-pool
   residency* rather than faster disks. Note that on an array like this `iostat %util` is meaningless —
   see [Monitoring](#monitoring--whats-going-on).
 - **Nor is the 10 GbE data plane.** The load is an extremely high count of very small round trips, so it
@@ -116,8 +116,8 @@ A large throughput win for bulk load.
 ALTER DATABASE senzing SET RECOVERY SIMPLE;
 ```
 
-For load / perf environments — avoids log-backup management and runaway log growth. Not a production DR
-posture.
+For load / perf environments — avoids log-backup management and runaway log growth. Not a production disaster recovery
+(DR) posture.
 
 ## Async statistics
 
@@ -148,9 +148,9 @@ Pure overhead (`QDS_ASYNC_QUEUE`) for this write-heavy load.
 ## Leave ADR / Optimized Locking off
 
 > [!CAUTION]
-> Do **not** enable `ACCELERATED_DATABASE_RECOVERY` or `OPTIMIZED_LOCKING` for a large cache-bound load.
-> ADR's persistent version store steals buffer pool from the hot feature tables (measured net-negative),
-> and Optimized Locking (which requires ADR; SQL Server 2025+) only claws back part of that. RCSI already
+> Do **not** enable accelerated database recovery (ADR, `ACCELERATED_DATABASE_RECOVERY`) or optimized
+> locking (`OPTIMIZED_LOCKING`) for a large cache-bound load. ADR's persistent version store steals
+> buffer pool from the hot feature tables (measured net-negative), and optimized locking (which requires ADR; SQL Server 2025+) only claws back part of that. RCSI already
 > covers lock contention.
 
 # Instance & server settings
@@ -162,11 +162,11 @@ EXEC sp_configure 'max degree of parallelism', 0;
 EXEC sp_configure 'cost threshold for parallelism', 500;
 ```
 
-A high cost threshold keeps the cheap per-record OLTP queries serial without force-serializing
+A high cost threshold keeps the cheap per-record online transaction processing (OLTP) queries serial without force-serializing
 everything. Do **not** pin `MAXDOP 1`. Bonus: a parallel plan appearing on a per-record query is then an
 automatic bad-plan alarm.
 
-Verified on a ~1B-record fleet at 500: every engine statement runs at **average DOP 1.00**, and the only
+Verified on a ~1B-record fleet at 500: every engine statement runs at **average degree of parallelism (DOP) 1.00**, and the only
 parallel work left is SQL Server's own internal background tasks. The engine workload is fully serial,
 which is the intent.
 
@@ -253,8 +253,8 @@ spinlock scaling regression and cutting system CPU. It is a **startup** trace fl
 ## ⭐ Optimize for sequential key
 
 **Critical for high-concurrency load.** The last-page insert latch (`PAGELATCH_EX`) on the ascending-key
-B-trees is the classic insert-throughput ceiling — OFSK (**SQL Server 2019+**) is its purpose-built fix,
-converting the raw convoy into managed `BTREE_INSERT_FLOW_CONTROL` and moving the wall off the DB. The v4
+B-trees is the classic insert-throughput ceiling — optimize for sequential key (OFSK, **SQL Server 2019+**) is its purpose-built fix,
+converting the raw convoy into managed `BTREE_INSERT_FLOW_CONTROL` and moving the wall off the database (DB). The v4
 schema already sets OFSK on the main hot tables; turn it on for the remaining ascending-key indexes it
 leaves off.
 
@@ -296,7 +296,7 @@ CREATE NONCLUSTERED INDEX RES_FEAT_EKEY_SK ON RES_FEAT_EKEY (RES_ENT_ID, FTYPE_I
 <summary><b>High feature-density data (~100+ features/record) only</b> — fully cover the candidate feature-load</summary>
 
 > [!WARNING]
-> A DBA knob, **not** a default — it enlarges the index and raises fragmentation (needs periodic
+> A database administrator (DBA) knob, **not** a default — it enlarges the index and raises fragmentation (needs periodic
 > `ONLINE REORGANIZE`). Unnecessary below high density.
 
 ```sql
@@ -307,7 +307,7 @@ CREATE NONCLUSTERED INDEX RES_FEAT_EKEY_SK ON RES_FEAT_EKEY (RES_ENT_ID, FTYPE_I
 
 ## ⭐ Drop IX_EVAL_QUEUE — redundant with the primary key
 
-`SYS_EVAL_QUEUE` has the PK on `MSG_ID` plus `IX_EVAL_QUEUE (ENT_SRC_KEY, DSRC_CODE)`; the latter is
+`SYS_EVAL_QUEUE` has the primary key (PK) on `MSG_ID` plus `IX_EVAL_QUEUE (ENT_SRC_KEY, DSRC_CODE)`; the latter is
 **redundant**. `MSG_ID = fnv1a_hash(encrypted ENT_SRC_KEY) >> 1` is deterministic in `ENT_SRC_KEY`,
 and the enqueue's `DSRC_CODE` is the constant `'__REPAIR__'`, so both uniques are **1:1 with the
 entity** — one entity targets exactly one row.
@@ -367,9 +367,9 @@ ALTER INDEX ALL ON LIB_FEAT REBUILD WITH (DATA_COMPRESSION = PAGE);
 
 ## Multiple data files
 
-Spreads allocation / free-space (`SPACEMGR_FREESPACE_CACHE`, PFS/GAM) contention across files under many
+Spreads allocation / free-space (`SPACEMGR_FREESPACE_CACHE`, page free space (PFS) and global allocation map (GAM)) contention across files under many
 concurrent inserters. Pre-size for large loads (on Linux ext4/xfs this uses `fallocate` — seconds, not a
-zero-fill; the `instant_file_initialization_enabled` DMV false-negatives `N` on Linux, ignore it).
+zero-fill; the `instant_file_initialization_enabled` dynamic management view (DMV) false-negatives `N` on Linux, ignore it).
 
 > [!WARNING]
 > Applies wherever **you control the database files** — self-managed SQL Server (bare metal, VM, or
@@ -386,7 +386,7 @@ ALTER DATABASE senzing MODIFY FILEGROUP [PRIMARY] AUTOGROW_ALL_FILES;
 
 ## Wide feature-value column
 
-Ensure `LIB_FEAT.FELEM_VALUES` is `VARCHAR(MAX)` — long or multibyte (e.g. CJK) feature values otherwise
+Ensure `LIB_FEAT.FELEM_VALUES` is `VARCHAR(MAX)` — long or multibyte (e.g. Chinese, Japanese and Korean (CJK)) feature values otherwise
 fail to insert.
 
 # ODBC client
@@ -408,7 +408,7 @@ Senzing application containers reach SQL Server through ODBC:
 
 These are Senzing engine settings, not SQL Server knobs, but they dominate the load profile:
 
-- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing v4.4+**) — the single largest reduction
+- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing software v4.4+**) — the single largest reduction
   in physical reads/record.
 - **On high-name-density data, set the generic NAME behavior to `"sendToRedo":"No"`** — otherwise generic
   name keys generate a self-amplifying redo pile that starves forward progress.
