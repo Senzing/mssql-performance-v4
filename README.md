@@ -1,3 +1,5 @@
+<p><img src="assets/senzing-logo.jpg" alt="Senzing logo" width="56"></p>
+
 # mssql-performance
 
 Performance tuning for running **Senzing v4** on **Microsoft SQL Server** under high-throughput load —
