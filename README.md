@@ -2,10 +2,10 @@
 
 # mssql-performance
 
-Performance tuning for running **SENZING® v4 software** on **Microsoft SQL Server** under high-throughput load —
+Performance tuning for running **SENZING® SDK v4** on **Microsoft SQL Server** under high-throughput load —
 companion to
 [performance-general-v4](https://github.com/Senzing/performance-general-v4/blob/main/README.md). Apply
-everything below **after** the standard Senzing v4 schema and **before** loading; each `ALTER`/index step
+everything below **after** the standard Senzing SDK v4 schema and **before** loading; each `ALTER`/index step
 is metadata-only on the empty tables (instant).
 
 > [!IMPORTANT]
@@ -56,7 +56,7 @@ different memory-to-dataset ratio will rank them differently.
 | Local storage | Dell BOSS SATA boot + 4–8 TB local NVMe for datasets/scratch — **not** on the database input/output (IO) path |
 | Network | 10 GbE, same data-plane segment as the database server |
 | OS | Ubuntu 24.04 LTS, kernel 6.8 |
-| Role | Runs the containerized Senzing v4 workers — parallel `add_record` consumers plus redo processors — driving the database server remotely over the data-plane network |
+| Role | Runs the containerized Senzing SDK v4 workers — parallel `add_record` consumers plus redo processors — driving the database server remotely over the data-plane network |
 
 A third small host runs only the message broker that feeds the workers; it is not in the measurement path.
 
@@ -408,7 +408,7 @@ Senzing application containers reach SQL Server through ODBC:
 
 These are Senzing engine settings, not SQL Server knobs, but they dominate the load profile:
 
-- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing software v4.4+**) — the single largest reduction
+- ⭐ **Enable the `RES_ENT.FEATURES` feature store** (**Senzing SDK 4.4+**) — the single largest reduction
   in physical reads/record.
 - **On high-name-density data, set the generic NAME behavior to `"sendToRedo":"No"`** — otherwise generic
   name keys generate a self-amplifying redo pile that starves forward progress.
